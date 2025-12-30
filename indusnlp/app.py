@@ -12,6 +12,7 @@ from pathlib import Path
 from functools import wraps
 
 from flask import Flask, request, jsonify, send_file
+from werkzeug.exceptions import HTTPException
 from dotenv import load_dotenv
 
 # Add parent directory to path for imports
@@ -32,19 +33,52 @@ app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024  # 100MB max upload
 UPLOAD_FOLDER = tempfile.mkdtemp(prefix="indusnlp_uploads_")
 OUTPUT_FOLDER = tempfile.mkdtemp(prefix="indusnlp_outputs_")
 
+# ============================================================
+# Utility Functions
+# ============================================================
+def _to_bool(v, default):
+    """Normalize value to boolean with fallback."""
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.lower() == "true"
+    if v is None:
+        return default
+    return bool(v)
+
+def _parse_int(value, default, min_val, max_val):
+    """Parse integer with bounds checking and fallback."""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(min_val, min(max_val, v))
 
 # ============================================================
-# Error Handler Decorator
+# Error Handler Decorator (Fixed)
 # ============================================================
 def handle_errors(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         try:
             return f(*args, **kwargs)
+        except HTTPException as e:
+            # ✅ Preserve HTTPException status codes
+            return jsonify({"success": False, "error": e.description}), e.code
         except Exception as e:
+            # Fallback: internal server error
             return jsonify({"success": False, "error": str(e)}), 500
     return decorated_function
 
+# ============================================================
+# Temp Directory Cleanup
+# ============================================================
+@app.teardown_appcontext
+def cleanup_temp_dirs(exception=None):
+    """Clean up global temp directories on app context teardown."""
+    for folder in (UPLOAD_FOLDER, OUTPUT_FOLDER):
+        if os.path.exists(folder):
+            shutil.rmtree(folder, ignore_errors=True)
 
 # ============================================================
 # Health Check Endpoint
@@ -56,14 +90,13 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "service": "IndusNLP API",
-        "version": "2.0.0",
+        "version": "2.0.1",  # Updated version
         "endpoints": {
             "ocr": "/api/ocr",
             "clean": "/api/clean",
             "qna": "/api/qna"
         }
     })
-
 
 # ============================================================
 # OCR Endpoint
@@ -146,9 +179,8 @@ def ocr_endpoint():
         if os.path.exists(temp_input):
             os.remove(temp_input)
 
-
 # ============================================================
-# Text Cleaning Endpoint
+# Text Cleaning Endpoint (Fixed)
 # ============================================================
 @app.route("/api/clean", methods=["POST"])
 @handle_errors
@@ -169,7 +201,7 @@ def clean_endpoint():
     - JSON with cleaned text for single text/file
     - ZIP file with cleaned files for ZIP input
     """
-    # Parse options
+    # Parse options from query params with defaults
     transliterate = request.args.get("transliterate", "true").lower() == "true"
     filter_badwords = request.args.get("filter_badwords", "true").lower() == "true"
     
@@ -177,8 +209,10 @@ def clean_endpoint():
     if request.is_json:
         data = request.get_json()
         text = data.get("text", "")
-        transliterate = data.get("transliterate", transliterate)
-        filter_badwords = data.get("filter_badwords", filter_badwords)
+        
+        # ✅ Fixed: Normalize booleans from JSON with proper fallback
+        transliterate = _to_bool(data.get("transliterate"), transliterate)
+        filter_badwords = _to_bool(data.get("filter_badwords"), filter_badwords)
         
         if not text:
             return jsonify({"success": False, "error": "No text provided"}), 400
@@ -259,9 +293,8 @@ def clean_endpoint():
         if os.path.exists(temp_input):
             os.remove(temp_input)
 
-
 # ============================================================
-# Q&A Generation Endpoint
+# Q&A Generation Endpoint (Fixed)
 # ============================================================
 @app.route("/api/qna", methods=["POST"])
 @handle_errors
@@ -275,8 +308,8 @@ def qna_endpoint():
     - ZIP file containing TXT files
     
     Options (query params or JSON):
-    - num_questions: int (default: 25) - Number of questions to generate
-    - batch_size: int (default: 25) - Questions per API call
+    - num_questions: int (default: 25, 1-300) - Number of questions to generate
+    - batch_size: int (default: 25, 1-50) - Questions per API call
     
     Returns:
     - JSON with generated Q&A pairs
@@ -289,9 +322,9 @@ def qna_endpoint():
             "error": "GEMINI_API_KEY not configured. Set it in environment variables."
         }), 400
     
-    # Parse options
-    num_questions = int(request.args.get("num_questions", 25))
-    batch_size = int(request.args.get("batch_size", 25))
+    # ✅ Fixed: Parse integers with bounds validation
+    num_questions = _parse_int(request.args.get("num_questions"), 25, 1, 300)
+    batch_size = _parse_int(request.args.get("batch_size"), 25, 1, 50)
     
     # Initialize Q&A pipeline
     qna_pipeline = QnAPipeline(api_key=api_key)
@@ -300,8 +333,10 @@ def qna_endpoint():
     if request.is_json:
         data = request.get_json()
         text = data.get("text", "")
-        num_questions = data.get("num_questions", num_questions)
-        batch_size = data.get("batch_size", batch_size)
+        
+        # ✅ Fixed: Parse integers from JSON with bounds validation
+        num_questions = _parse_int(data.get("num_questions"), num_questions, 1, 300)
+        batch_size = _parse_int(data.get("batch_size"), batch_size, 1, 50)
         
         if not text:
             return jsonify({"success": False, "error": "No text provided"}), 400
@@ -375,7 +410,6 @@ def qna_endpoint():
         if os.path.exists(temp_input):
             os.remove(temp_input)
 
-
 # ============================================================
 # Main Entry Point
 # ============================================================
@@ -384,7 +418,6 @@ def main():
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
     app.run(host="0.0.0.0", port=port, debug=debug)
-
 
 if __name__ == "__main__":
     main()

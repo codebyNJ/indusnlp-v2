@@ -7,12 +7,17 @@ import os
 import tempfile
 import shutil
 import zipfile
+import logging
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 
 class OCRPipeline:
@@ -46,42 +51,48 @@ class OCRPipeline:
         
         Args:
             pdf_path: Full path to the PDF file
-            
+        
         Returns:
             Extracted text from the PDF
         """
-        # Upload file to Mistral
-        with open(pdf_path, "rb") as f:
-            uploaded_file = self.client.files.upload(
-                file={
-                    "file_name": os.path.basename(pdf_path),
-                    "content": f
+        try:
+            # Upload file to Mistral (FIXED: correct file upload format)
+            filename = os.path.basename(pdf_path)
+            with open(pdf_path, "rb") as f:
+                uploaded_file = self.client.files.upload(
+                    file={
+                        "file_name": filename,
+                        "content": f
+                    },
+                    purpose="ocr"
+                )
+            
+            # Get signed URL
+            file_url = self.client.files.get_signed_url(file_id=uploaded_file.id)
+            
+            # Run OCR
+            response = self.client.ocr.process(
+                model="mistral-ocr-latest",
+                document={
+                    "type": "document_url",
+                    "document_url": file_url.url
                 },
-                purpose="ocr"
+                include_image_base64=False,
             )
-        
-        # Get signed URL
-        file_url = self.client.files.get_signed_url(file_id=uploaded_file.id)
-        
-        # Run OCR
-        response = self.client.ocr.process(
-            model="mistral-ocr-latest",
-            document={
-                "type": "document_url",
-                "document_url": file_url.url
-            },
-            include_image_base64=False,
-        )
-        
-        # Extract text from all pages
-        text_parts = []
-        for page in response.pages:
-            page_text = getattr(page, "markdown", "") or getattr(page, "text", "")
-            text_parts.append(page_text.strip())
-        
-        return "\n\n".join(text_parts)
+            
+            # Extract text from all pages
+            text_parts = []
+            for page in response.pages:
+                page_text = getattr(page, "markdown", "") or getattr(page, "text", "")
+                text_parts.append(page_text.strip())
+            
+            return "\n\n".join(text_parts)
+            
+        except Exception as e:
+            logger.error(f"OCR failed for {pdf_path}: {str(e)}")
+            raise
     
-    def process_pdf_to_file(self, pdf_path: str, output_dir: Path, base_dir: Optional[Path] = None) -> bool:
+    def process_pdf_to_file(self, pdf_path: str, output_dir: Path, base_dir: Optional[Path] = None, attempt: int = 1) -> bool:
         """
         Process a single PDF file and save result to a text file.
         
@@ -89,7 +100,8 @@ class OCRPipeline:
             pdf_path: Full path to the PDF file
             output_dir: Directory where output .txt files will be saved
             base_dir: Base directory to compute relative paths (for preserving structure)
-            
+            attempt: Retry attempt number for logging
+        
         Returns:
             True if successful, False otherwise
         """
@@ -111,13 +123,16 @@ class OCRPipeline:
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(text)
             
+            logger.info(f"Successfully processed {pdf_path} -> {txt_path} (attempt {attempt})")
             return True
+            
         except Exception as e:
-            print(f"Error processing {pdf_path}: {e}")
-            # Log error
+            logger.error(f"Error processing {pdf_path} (attempt {attempt}): {str(e)}")
+            # Log error with context
             error_path = output_dir / "errors.txt"
+            error_entry = f"[ERROR {pdf_path} attempt {attempt}: {str(e)}]\n"
             with open(error_path, "a", encoding="utf-8") as ef:
-                ef.write(f"[ERROR processing {pdf_path}: {e}]\n")
+                ef.write(error_entry)
             return False
     
     def get_all_pdfs(self, folder: str) -> List[str]:
@@ -136,7 +151,7 @@ class OCRPipeline:
         Args:
             directory: Directory containing PDFs
             output_dir: Output directory for text files
-            
+        
         Returns:
             Dict with processing results
         """
@@ -144,9 +159,13 @@ class OCRPipeline:
         pdf_files = self.get_all_pdfs(str(directory))
         
         if not pdf_files:
+            logger.warning(f"No PDF files found in {directory}")
             return results
         
-        for pdf_path in pdf_files:
+        logger.info(f"Processing {len(pdf_files)} PDFs from {directory}")
+        
+        for i, pdf_path in enumerate(pdf_files, 1):
+            logger.info(f"Processing {i}/{len(pdf_files)}: {os.path.basename(pdf_path)}")
             if self.process_pdf_to_file(pdf_path, output_dir, base_dir=directory):
                 results["processed"] += 1
                 results["files"].append(os.path.basename(pdf_path))
@@ -155,14 +174,15 @@ class OCRPipeline:
         
         return results
     
-    def process_input(self, input_path: Path, output_dir: Path) -> Dict[str, Any]:
+    def process_input(self, input_path: Path, output_dir: Path, return_text_for_single_pdf: bool = True) -> Dict[str, Any]:
         """
         Handle different input types: PDF file, ZIP file, or directory.
         
         Args:
             input_path: Path to input (PDF/ZIP/directory)
             output_dir: Output directory
-            
+            return_text_for_single_pdf: Whether to return extracted text for single PDF files
+        
         Returns:
             Dict with processing results
         """
@@ -173,11 +193,16 @@ class OCRPipeline:
             if input_path.is_file():
                 suffix = input_path.suffix.lower()
                 if suffix == ".pdf":
-                    # Single PDF file
+                    # Single PDF file - FIXED: consistent behavior with file output + optional text return
                     output_dir.mkdir(parents=True, exist_ok=True)
-                    text = self.process_pdf(str(input_path))
-                    results["text"] = text
-                    results["processed"] = 1
+                    success = self.process_pdf_to_file(str(input_path), output_dir)
+                    
+                    if success and return_text_for_single_pdf:
+                        # Also return text for API compatibility
+                        results["text"] = self.process_pdf(str(input_path))
+                    
+                    results["processed"] = 1 if success else 0
+                    results["failed"] = 0 if success else 1
                     results["files"].append(input_path.name)
                     
                 elif suffix == ".zip":
@@ -199,6 +224,10 @@ class OCRPipeline:
                 output_dir.mkdir(parents=True, exist_ok=True)
                 results = self.process_directory(input_path, output_dir)
                 
+        except Exception as e:
+            logger.error(f"Failed to process input {input_path}: {str(e)}")
+            results["failed"] += 1
+            
         finally:
             if temp_dir and temp_dir.exists():
                 shutil.rmtree(temp_dir, ignore_errors=True)
@@ -214,7 +243,7 @@ def process_pdf(pdf_path: str, api_key: Optional[str] = None) -> str:
     Args:
         pdf_path: Path to PDF file
         api_key: Optional Mistral API key
-        
+    
     Returns:
         Extracted text
     """
@@ -235,7 +264,7 @@ if __name__ == "__main__":
     
     input_path = Path(args.input)
     if not input_path.exists():
-        print(f"❌ Input path does not exist: {input_path}")
+        logger.error(f"Input path does not exist: {input_path}")
         exit(1)
     
     pipeline = OCRPipeline()
@@ -243,3 +272,6 @@ if __name__ == "__main__":
     
     print(f"\n🎉 OCR Complete!")
     print(f"✅ Processed: {results['processed']}, Failed: {results['failed']}")
+    if results.get("files"):
+        print(f"📄 Files: {', '.join(results['files'][:5])}" + 
+              (f" (and {len(results['files'])-5} more)" if len(results['files']) > 5 else ""))
